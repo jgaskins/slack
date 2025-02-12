@@ -36,7 +36,6 @@ module Slack
         in PostMessageResponse
           result
         in Error
-          pp result
           raise Exception.new(result.errors.join(", "), error: result.error)
         end
       end
