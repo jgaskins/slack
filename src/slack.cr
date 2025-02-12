@@ -6,6 +6,9 @@ require "uri/json"
 require "uuid/json"
 require "db/pool"
 
+require "./api/api"
+require "./api/bots"
+
 module Slack
   VERSION = "0.1.0"
   Log     = ::Log.for(self)
@@ -43,6 +46,8 @@ module Slack
     InvalidArgName
     InvalidArguments
     InvalidArrayArg
+    InvalidBlocks
+    InvalidBlocksFormat
     InvalidCharset
     InvalidFormData
     InvalidPostType
@@ -119,10 +124,7 @@ module Slack
 
     # Override this to handle errors
     def error(ex : ::Exception)
-      log.error { ex }
-      if trace = ex.backtrace?
-        trace.each { |line| log.error { line } }
-      end
+      log.error(exception: ex) { ex }
     end
 
     def close
@@ -199,10 +201,7 @@ module Slack
 
       # Override this to handle errors
       def error(ex : ::Exception)
-        log.error { ex }
-        if trace = ex.backtrace?
-          trace.each { |line| log.error { line } }
-        end
+        log.error(exception: ex) { ex }
       end
 
       def react_to(msg, with reaction : String)
@@ -221,24 +220,40 @@ module Slack
         )
       end
 
+      def reply_to(msg, blocks : Array(Block))
+        chat.post_message(
+          channel: msg.channel,
+          blocks: blocks,
+          thread_ts: msg.thread_ts || msg.ts,
+        )
+      end
+
       def mention(user : String)
-        "<@#{user}>"
+        if user.starts_with?("<@") && user.ends_with?(">")
+          user
+        else
+          "<@#{user}>"
+        end
       end
 
       def chat
-        Chat.new(self)
+        Chat.new self
       end
 
       def conversations
-        Conversations.new(self)
+        Conversations.new self
       end
 
       def reactions
-        Reactions.new(self)
+        Reactions.new self
       end
 
       def users
-        Users.new(self)
+        Users.new self
+      end
+
+      def bots
+        Bots.new self
       end
 
       def auth
@@ -265,180 +280,11 @@ module Slack
         end
       end
 
-      def get_file(file : ::Slack::File)
+      def get_file(file : ::Slack::File, &)
         headers = HTTP::Headers{"host" => file.permalink.host.to_s}
         @pool.checkout &.get file.permalink.request_target, headers: headers do |response|
           yield response
         end
-      end
-    end
-
-    struct Error
-      include JSON::Serializable
-
-      getter? ok : Bool
-      getter error : ::Slack::Error
-    end
-
-    struct PostMessageResponse
-      include JSON::Serializable
-
-      getter? ok : Bool
-      getter channel : String
-      getter ts : String
-      getter message : JSON::Any # Message
-      getter warning : String?
-      # getter response_metadata
-    end
-
-    abstract struct API
-      def initialize(@client : Client)
-      end
-    end
-
-    struct Chat < API
-      def post_message(channel : String, text : String, thread_ts : String? = nil)
-        body = {
-          channel:   channel,
-          text:      text,
-          thread_ts: thread_ts,
-        }
-        @client.post "chat.postMessage", body: body, return: PostMessageResponse
-      end
-    end
-
-    struct Conversations < API
-      def replies(channel : String, ts : String)
-        pp params = URI::Params{
-          "channel" => channel,
-          "ts"      => ts,
-        }
-        @client.get "conversations.replies", params: params, return: Replies
-      end
-
-      struct Replies
-        include JSON::Serializable
-
-        getter? ok : Bool
-        @[JSON::Field(converter: ::Slack::API::Conversations::Replies::Messages)]
-        getter messages : Array(Message | FileShare)
-        getter? has_more : Bool
-
-        module Messages
-          extend self
-
-          def self.from_json(json : JSON::PullParser)
-            messages = [] of Message | FileShare
-            json.read_array do
-              messages << Message.new(json).as(Message | FileShare)
-            end
-            messages
-          end
-        end
-      end
-    end
-
-    struct Auth < API
-      def test
-        @client.get "auth.test", return: Test
-      end
-
-      struct Test
-        include JSON::Serializable
-
-        getter? ok : Bool
-        getter url : URI
-        getter team : String
-        getter user : String
-        getter team_id : String
-        getter user_id : String
-      end
-    end
-
-    struct Users < API
-      def info(user : String)
-        user = user.strip
-        if user.starts_with?("<@") && user.ends_with?(">")
-          user = user[2..-2]
-        end
-        params = URI::Params{
-          "user" => user,
-        }
-
-        @client.post "users.info", params: params, return: UserResponse
-      end
-
-      def identity
-        @client.post "users.identity", return: IdentityResponse
-      end
-
-      struct UserResponse
-        include JSON::Serializable
-        getter? ok : Bool
-        getter user : User
-      end
-
-      struct User
-        include JSON::Serializable
-        getter id : String
-        getter team_id : String
-        getter name : String
-        getter? deleted : Bool
-        getter color : String
-        getter real_name : String
-        getter tz : String
-        getter tz_label : String
-        getter tz_offset : Int64
-
-        macro predicate(*names)
-          {% for name in names %}
-            @[JSON::Field(key: "is_{{name.id}}")]
-            getter? {{name.id}} : Bool = false
-          {% end %}
-        end
-
-        predicate admin, owner, primary_owner, restricted, ultra_restricted, bot, app_user, email_confirmed
-      end
-
-      struct IdentityResponse
-        include JSON::Serializable
-        getter? ok : Bool
-        getter user : UserIdentity
-        getter team : TeamIdentity
-
-        struct UserIdentity
-          include JSON::Serializable
-          getter name : String
-          getter id : String
-          getter email : String?
-        end
-
-        struct TeamIdentity
-          include JSON::Serializable
-          getter id : String
-        end
-      end
-    end
-
-    struct Reactions < API
-      def add(name : String, channel : String, timestamp : String)
-        body = {
-          name:      name,
-          channel:   channel,
-          timestamp: timestamp,
-        }
-
-        @client.post "reactions.add", body: body, return: JSON::Any
-      end
-
-      def remove(name : String, channel : String, timestamp : String)
-        body = {
-          name:      name,
-          channel:   channel,
-          timestamp: timestamp,
-        }
-
-        @client.post "reactions.remove", body: body, return: JSON::Any
       end
     end
   end
@@ -508,7 +354,6 @@ module Slack
     end
 
     def self.[](json : String)
-      Log.debug { json }
       parser = JSON::PullParser.new(json)
       parser.on_key "type" do
         name = parser.read_string
@@ -553,19 +398,24 @@ module Slack
     # getter type : String?
 
     use_json_discriminator "type", {
-      app_mention:            AppMention,
-      broadcast:              Broadcast,
-      emoji:                  Emoji,
-      message:                Message,
-      reaction_added:         ReactionAdded,
-      reaction_removed:       ReactionRemoved,
+      app_mention:      AppMention,
+      message:          Message,
+      reaction_added:   ReactionAdded,
+      reaction_removed: ReactionRemoved,
+
       rich_text:              RichText,
-      rich_text_quote:        RichTextQuote,
-      rich_text_section:      RichTextSection,
-      rich_text_list:         RichTextList,
-      rich_text_preformatted: RichTextSection,
-      text:                   Text,
-      user:                   User,
+      rich_text_quote:        RichText::Quote,
+      rich_text_section:      RichText::Section,
+      rich_text_list:         RichText::List,
+      rich_text_preformatted: RichText::Preformatted,
+      broadcast:              RichText::Broadcast,
+      color:                  RichText::Color,
+      channel:                RichText::Channel,
+      date:                   RichText::Date,
+      emoji:                  RichText::Emoji,
+      link:                   RichText::Link,
+      text:                   RichText::Text,
+      user:                   RichText::User,
     }
   end
 
@@ -620,6 +470,7 @@ module Slack
       when "message_deleted" then MessageDeleted.from_json(json)
       when "message_changed" then MessageChanged.from_json(json)
       when "file_share"      then FileShare.from_json(json)
+      when "channel_join"    then ChannelJoin.from_json(json)
       else
         raise ::JSON::SerializableError.new("Unknown 'subtype' discriminator value: #{discriminator_value.inspect}", to_s, nil, *location, nil)
       end
@@ -662,6 +513,9 @@ module Slack
     getter channel : String
     getter channel_type : String
     getter blocks : Array(Block) { [] of Block }
+  end
+
+  struct ChannelJoin < Block
   end
 
   struct RelatedMessage < Block
@@ -825,29 +679,154 @@ module Slack
   end
 
   struct RichText < Block
+    getter type = "rich_text"
+    @[JSON::Field(ignore_serialize: block_id.empty?)]
     getter block_id : String
     getter elements : Array(Block)
-  end
 
-  struct RichTextSection < Block
-    getter elements : Array(Block)
-  end
+    def initialize(elements : Array(BlockElement), @block_id = "")
+      @elements = elements.map(&.as(Block))
+    end
 
-  struct RichTextQuote < Block
-    getter elements : Array(Block)
-  end
+    module Blocks
+      def blocks(*elements : Block) : Array(Block)
+        blocks = Array(Block).new(elements.size)
+        elements.each { |e| blocks << e.as(Block) }
+        blocks
+      end
 
-  struct RichTextList < Block
-    include JSON::Serializable::Unmapped
+      def rich_text(elements)
+        RichText.new(elements)
+      end
 
-    getter elements : Array(Block)
-    getter style : Style
-    getter indent : Int32
-    getter border : Int32
+      def list(style : List::Style, elements, indent = 0)
+        List.new(style, elements, indent: indent)
+      end
 
-    enum Style
-      Ordered
-      Bullet
+      def section(elements)
+        Section.new(elements)
+      end
+
+      def text(text : String)
+        Text.new(text)
+      end
+
+      def code(code : String)
+        Text.new(code, style: Text::Style.new(code: true))
+      end
+    end
+
+    abstract struct BlockElement < Block
+      use_json_discriminator "type", {
+        rich_text_section:      Section,
+        rich_text_list:         List,
+        rich_text_preformatted: Preformatted,
+        rich_text_quote:        Quote,
+      }
+    end
+
+    abstract struct TextElement < Slack::Block
+      use_json_discriminator "type", {
+        broadcast: Broadcast,
+        color:     Color,
+        channel:   Channel,
+        date:      Date,
+        emoji:     Emoji,
+        link:      Link,
+        text:      Text,
+        user:      User,
+        usergroup: UserGroup,
+      }
+    end
+
+    struct Section < BlockElement
+      getter type = "rich_text_section"
+      getter elements : Array(TextElement)
+
+      def initialize(elements)
+        @elements = elements.map(&.as(TextElement)).to_a
+      end
+    end
+
+    struct Preformatted < BlockElement
+      getter type = "rich_text_preformatted"
+      getter elements : Array(Text)
+
+      def initialize(@elements)
+      end
+    end
+
+    struct Quote < BlockElement
+      getter type = "rich_text_quote"
+      getter elements : Array(Block)
+
+      def initialize(@elements)
+      end
+    end
+
+    struct List < BlockElement
+      include JSON::Serializable::Unmapped
+
+      getter type = "rich_text_list"
+      getter elements : Array(Section)
+      getter style : Style
+      @[JSON::Field(ignore_serialize: indent.zero?)]
+      getter indent : Int32 = 0
+      @[JSON::Field(ignore_serialize: border.zero?)]
+      getter border : Int32 = 0
+
+      def initialize(@style, @elements, @indent = 0, @border = 0)
+      end
+
+      enum Style
+        Ordered
+        Bullet
+      end
+    end
+
+    struct Broadcast < TextElement
+    end
+
+    struct Color < TextElement
+    end
+
+    struct Channel < TextElement
+    end
+
+    struct Date < TextElement
+    end
+
+    struct Emoji < TextElement
+    end
+
+    struct Link < TextElement
+    end
+
+    struct Text < TextElement
+      getter type = "text"
+      getter text : String
+      getter style : Style?
+
+      def initialize(@text, @style = nil)
+      end
+
+      struct Style
+        include JSON::Serializable
+
+        getter? bold : Bool?
+        getter? italic : Bool?
+        getter? strike : Bool?
+        getter? code : Bool?
+
+        def initialize(*, @bold = nil, @italic = nil, @strike = nil, @code = nil)
+        end
+      end
+    end
+
+    struct User < TextElement
+    end
+
+    struct UserGroup < TextElement
     end
   end
 
@@ -864,8 +843,10 @@ module Slack
     getter unicode : String?
   end
 
-  struct Text < Block
-    getter text : String
+  record Text < Block, text : String, style : Style? = nil do
+    record Style < Block, bold : Bool?, italic : Bool?, strike : Bool?, code : Bool? do
+      include JSON::Serializable
+    end
   end
 
   struct Authorization < Block
